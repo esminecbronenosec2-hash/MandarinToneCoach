@@ -1,6 +1,7 @@
 .gradle/
-.idea/
-local.properties
 **/build/
+.idea/
 *.iml
-.DS_Store
+local.properties
+app/src/main/assets/vosk-model-small-cn-0.22.zip
+*.apk

@@ -3,54 +3,236 @@ package com.mandarin.tonecoach;
 import android.Manifest;
 import android.app.Activity;
 import android.content.pm.PackageManager;
-import android.graphics.*;
-import android.media.*;
-import android.os.*;
+import android.graphics.Color;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
+import android.os.Bundle;
 import android.speech.tts.TextToSpeech;
-import android.view.*;
-import android.widget.*;
-import java.util.*;
+import android.webkit.JavascriptInterface;
+import android.webkit.WebChromeClient;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import android.content.SharedPreferences;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+import java.util.Locale;
 
+/** Fully local Android bridge. UI is packaged HTML/CSS and never connects to a server. */
 public class MainActivity extends Activity {
-    private final String[] hanzi={"妈","麻","马","骂","吗","你好","谢谢","中国","老师","朋友","我很好","你好吗"};
-    private final String[] pinyin={"mā","má","mǎ","mà","ma","nǐ hǎo","xiè xie","zhōng guó","lǎo shī","péng you","wǒ hěn hǎo","nǐ hǎo ma"};
-    private final String[] meanings={"мама","конопля","лошадь","ругать","вопросительная частица","привет","спасибо","Китай","учитель","друг","у меня всё хорошо","как дела?"};
-    private final int[] tones={1,2,3,4,5,3,4,1,3,2,3,3};
-    private final int bg=Color.rgb(15,20,38), surface=Color.rgb(29,36,60), accent=Color.rgb(124,111,255), white=Color.WHITE;
-    private LinearLayout root, body; private TextView status; private PitchView pitchView;
-    private TextToSpeech tts; private AudioRecord recorder; private Thread recordThread; private volatile boolean recording=false;
-    private short[] audio=new short[16000*4]; private int count=0, index=0, correct=0, quizCount=0; private int mode=0;
-    private float[] lastContour=new float[0]; private final Random random=new Random();
-    @Override public void onCreate(Bundle b){super.onCreate(b);getWindow().setStatusBarColor(bg);getWindow().setNavigationBarColor(bg);quizCount=getPreferences(0).getInt("quiz",0);correct=getPreferences(0).getInt("correct",0);tts=new TextToSpeech(this, s->{if(s==TextToSpeech.SUCCESS && tts!=null)tts.setLanguage(Locale.SIMPLIFIED_CHINESE);});show(0);}
-    private TextView text(String s,int size,boolean bold){TextView v=new TextView(this);v.setText(s);v.setTextSize(size);v.setTextColor(white);v.setPadding(4,9,4,9);if(bold)v.setTypeface(null,1);return v;}
-    private void add(TextView v){body.addView(v);}
-    private Button button(String label,Runnable click){Button b=new Button(this);b.setText(label);b.setTextColor(white);b.setAllCaps(false);b.setBackgroundTintList(android.content.res.ColorStateList.valueOf(accent));b.setOnClickListener(v->click.run());body.addView(b);return b;}
-    private void show(int tab){mode=tab;root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);root.setBackgroundColor(bg);setContentView(root);
-        TextView title=text("Mandarin Tone Coach",25,true);title.setPadding(20,25,12,12);root.addView(title);
-        HorizontalScrollView nav=new HorizontalScrollView(this);LinearLayout tabs=new LinearLayout(this);tabs.setOrientation(LinearLayout.HORIZONTAL);
-        String[] names={"Тоны","Слова","Фразы","Викторина","Прогресс"};for(int i=0;i<names.length;i++){final int t=i;Button b=new Button(this);b.setText(names[i]);b.setAllCaps(false);b.setTextColor(white);b.setBackgroundTintList(android.content.res.ColorStateList.valueOf(i==tab?accent:surface));b.setOnClickListener(v->show(t));tabs.addView(b);}nav.addView(tabs);root.addView(nav);
-        ScrollView scroll=new ScrollView(this);body=new LinearLayout(this);body.setPadding(20,18,20,24);body.setOrientation(LinearLayout.VERTICAL);scroll.addView(body);root.addView(scroll);
-        if(tab==0)toneScreen();else if(tab==1)lessonScreen(false);else if(tab==2)lessonScreen(true);else if(tab==3)quizScreen();else progressScreen();
+    private static final int SAMPLE_RATE=16000, MAX_SECONDS=14;
+    private final short[] pcm=new short[SAMPLE_RATE*MAX_SECONDS];
+    private final OfflineModel recognition=new OfflineModel();
+    private WebView web;
+    private TextToSpeech tts;
+    private AudioRecord recorder;
+    private volatile boolean recording=false, processing=false;
+    private volatile int sampleCount=0;
+    private Thread captureThread;
+    private String currentText="你好", currentToneOverride="";
+    private boolean pageReady=false;
+    private String modelStatus="loading",modelMessage="Локальная модель загружается";
+
+    @Override public void onCreate(Bundle state){
+        super.onCreate(state);
+        getWindow().setStatusBarColor(Color.rgb(10,14,30));
+        getWindow().setNavigationBarColor(Color.rgb(10,14,30));
+        web=new WebView(this);
+        web.setBackgroundColor(Color.rgb(10,14,30));
+        web.getSettings().setJavaScriptEnabled(true);
+        web.getSettings().setDomStorageEnabled(false);
+        web.getSettings().setAllowFileAccess(true);
+        web.getSettings().setAllowFileAccessFromFileURLs(false);
+        web.getSettings().setAllowUniversalAccessFromFileURLs(false);
+        web.addJavascriptInterface(new Bridge(),"Native");
+        web.setWebChromeClient(new WebChromeClient());
+        web.setWebViewClient(new WebViewClient(){
+            @Override public void onPageFinished(WebView view,String url){pageReady=true;sendBoot();}
+        });
+        setContentView(web);
+        web.loadUrl("file:///android_asset/index.html");
+        tts=new TextToSpeech(this,result->{
+            if(result==TextToSpeech.SUCCESS && tts!=null){
+                int status=tts.setLanguage(Locale.SIMPLIFIED_CHINESE);
+                emit("tts", object("available",status!=TextToSpeech.LANG_NOT_SUPPORTED&&status!=TextToSpeech.LANG_MISSING_DATA));
+            }
+        });
+        recognition.initialize(this,(status,message)->{
+            modelStatus=status;modelMessage=message;
+            emit("model",object("status",status,"message",message));
+        });
     }
-    private void toneScreen(){add(text("Пять тонов путунхуа",22,true));String[] names={"1 — ровный высокий  ˉ","2 — восходящий  ˊ","3 — нисходяще-восходящий  ˇ","4 — резкий нисходящий  ˋ","5 — нейтральный"};for(int i=0;i<5;i++){final int t=i;button(names[i],()->{index=t;lessonScreenContent();});}add(text("Выбери тон, послушай образец и повтори его.",15,false));}
-    private void lessonScreen(boolean phrases){index=phrases?5:0;lessonScreenContent();}
-    private void lessonScreenContent(){body.removeAllViews();boolean phrases=mode==2;int start=phrases?5:0,end=phrases?hanzi.length:5;if(mode==0){start=0;end=5;}
-        add(text(mode==0?"Тренировка тонов":phrases?"Фразы":"Слова",22,true));
-        Spinner spinner=new Spinner(this);String[] entries=new String[end-start];for(int i=start;i<end;i++)entries[i-start]=hanzi[i]+"   "+pinyin[i]+" — "+meanings[i];ArrayAdapter<String> adapter=new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,entries);spinner.setAdapter(adapter);spinner.setSelection(Math.max(0,index-start));body.addView(spinner);
-        final int offset=start;spinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener(){public void onNothingSelected(android.widget.AdapterView<?> p){}public void onItemSelected(android.widget.AdapterView<?> p,View v,int pos,long id){int next=offset+pos;if(next!=index){index=next;lastContour=new float[0];lessonScreenContent();}}});
-        TextView word=text(hanzi[index],56,true);word.setGravity(Gravity.CENTER);add(word);TextView pron=text(pinyin[index]+"   ·   "+meanings[index],19,false);pron.setGravity(Gravity.CENTER);add(pron);
-        button("▶ Прослушать",()->{if(tts!=null)tts.speak(hanzi[index],TextToSpeech.QUEUE_FLUSH,null,"sample");});
-        pitchView=new PitchView();body.addView(pitchView,new LinearLayout.LayoutParams(-1,dp(220)));
-        status=text("Нажми «Записать», произнеси слово и останови запись.",15,false);add(status);
-        button("🎙 Записать / Остановить",()->{if(recording)stopRecording();else startRecording();});
-        add(text("Оценка приблизительная: график отражает высоту голоса, но не проверяет согласные, гласные и правильность всей фразы.",13,false));
+    private SharedPreferences prefs(){return getSharedPreferences("mtc_v2",MODE_PRIVATE);}
+    private JSONObject object(Object... args){JSONObject obj=new JSONObject();try{for(int i=0;i<args.length;i+=2)obj.put(String.valueOf(args[i]),args[i+1]);}catch(JSONException ignored){}return obj;}
+    private JSONArray stored(String key){try{return new JSONArray(prefs().getString(key,"[]"));}catch(Exception e){return new JSONArray();}}
+    private void save(String key,JSONArray data){prefs().edit().putString(key,data.toString()).apply();}
+    private void emit(String type,JSONObject payload){
+        if(web==null||!pageReady)return;
+        JSONObject msg=object("type",type,"payload",payload);
+        runOnUiThread(()->{if(web!=null)web.evaluateJavascript("window.MTC&&window.MTC.onNative("+JSONObject.quote(msg.toString())+")",null);});
     }
-    private void startRecording(){if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},100);status.setText("Разреши доступ к микрофону и повтори попытку.");return;}
-        int min=AudioRecord.getMinBufferSize(16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);try{recorder=new AudioRecord(MediaRecorder.AudioSource.MIC,16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,Math.max(min,4096));if(recorder.getState()!=AudioRecord.STATE_INITIALIZED)throw new IllegalStateException("AudioRecord unavailable");count=0;recording=true;recorder.startRecording();status.setText("Идёт запись… нажми ещё раз, чтобы остановить.");recordThread=new Thread(()->{short[] buffer=new short[1024];while(recording&&count<audio.length){int n=recorder.read(buffer,0,Math.min(buffer.length,audio.length-count));if(n>0){System.arraycopy(buffer,0,audio,count,n);count+=n;}else if(n<0)break;}runOnUiThread(()->{if(recording)stopRecording();});});recordThread.start();}catch(Exception e){recording=false;status.setText("Не удалось открыть микрофон: "+e.getMessage());}}
-    private void stopRecording(){if(!recording)return;recording=false;try{recorder.stop();recorder.release();}catch(Exception ignored){}recorder=null;int len=count;status.setText("Анализируем запись…");new Thread(()->{float[] contour=PitchAnalyzer.contour(audio,len);int score=PitchAnalyzer.score(contour,tones[index]);runOnUiThread(()->{lastContour=contour;pitchView.invalidate();if(score==0)status.setText("Не удалось выделить голос. Попробуй записать чёткий слог в тихой комнате.");else{status.setText("Сходство контура: "+score+"/100"+(tones[index]==5?" (для нейтрального тона оценка условная)":""));getPreferences(0).edit().putInt("attempts",getPreferences(0).getInt("attempts",0)+1).putInt("total",getPreferences(0).getInt("total",0)+score).apply();}});}).start();}
-    private void quizScreen(){body.removeAllViews();add(text("Угадай тон на слух",22,true));int q=random.nextInt(5);add(text("Прослушай слог и выбери его тон.",17,false));button("▶ Воспроизвести",()->{if(tts!=null)tts.speak(hanzi[q],TextToSpeech.QUEUE_FLUSH,null,"quiz");});for(int i=1;i<=5;i++){final int answer=i;button("Тон "+i,()->{quizCount++;if(answer==q+1)correct++;getPreferences(0).edit().putInt("quiz",quizCount).putInt("correct",correct).apply();Toast.makeText(this,answer==q+1?"Верно!":"Правильный ответ: "+(q+1),Toast.LENGTH_LONG).show();quizScreen();});}}
-    private void progressScreen(){int attempts=getPreferences(0).getInt("attempts",0),total=getPreferences(0).getInt("total",0);add(text("Твой прогресс",24,true));add(text("Записей: "+attempts,20,false));add(text("Среднее сходство: "+(attempts==0?"—":total/attempts+"/100"),20,false));int quiz=getPreferences(0).getInt("quiz",0),wins=getPreferences(0).getInt("correct",0);add(text("Викторина: "+wins+" / "+quiz,20,false));button("Сбросить статистику",()->{getPreferences(0).edit().clear().apply();correct=quizCount=0;show(4);});}
-    private int dp(int value){return (int)(value*getResources().getDisplayMetrics().density);}
-    private class PitchView extends View{Paint p=new Paint(3);PitchView(){super(MainActivity.this);setBackgroundColor(surface);}protected void onDraw(Canvas c){super.onDraw(c);int w=getWidth(),h=getHeight();p.setStrokeWidth(dp(1));p.setColor(0xFF48506A);for(int i=1;i<5;i++)c.drawLine(0,h*i/5f,w,h*i/5f,p);drawLine(c,PitchAnalyzer.target(tones[index],64),0xFF9C91FF,3);if(lastContour.length>1)drawLine(c,lastContour,0xFF50D5B7,3);p.setColor(white);p.setTextSize(dp(12));c.drawText("Фиолетовый — цель  ·  Бирюзовый — голос",dp(10),dp(20),p);}void drawLine(Canvas c,float[] a,int color,int width){if(a.length<2)return;p.setColor(color);p.setStrokeWidth(dp(width));p.setStyle(Paint.Style.STROKE);Path path=new Path();for(int i=0;i<a.length;i++){float x=dp(12)+(getWidth()-dp(24))*i/(a.length-1f),y=getHeight()/2f-a[i]*getHeight()/22f;if(i==0)path.moveTo(x,y);else path.lineTo(x,y);}c.drawPath(path,p);p.setStyle(Paint.Style.FILL);}}
-    @Override protected void onDestroy(){recording=false;if(recorder!=null){try{recorder.stop();recorder.release();}catch(Exception ignored){}}if(tts!=null){tts.stop();tts.shutdown();}super.onDestroy();}
+    private void sendBoot(){
+        JSONObject state=object("saved",stored("saved"),"history",stored("history"),"modelStatus",modelStatus,"modelMessage",modelMessage,"recording",recording,"quizAttempts",prefs().getInt("quizAttempts",0),"quizCorrect",prefs().getInt("quizCorrect",0));
+        emit("boot",state);
+        emitPreview(currentText);
+    }
+    private void emitPreview(String text){
+        String val=text==null?"":text.trim();
+        PinyinTones.Reading reading=PinyinTones.parse(val);
+        int[] sandhi=PinyinTones.sandhi(val,reading.tones);
+        JSONArray syllables=new JSONArray(),tones=new JSONArray(),base=new JSONArray();
+        for(String item:reading.syllables)syllables.put(item);
+        for(int item:sandhi)tones.put(item);
+        for(int item:reading.tones)base.put(item);
+        emit("preview",object("text",val,"syllables",syllables,"tones",tones,"dictionaryTones",base,"toneString",PinyinTones.numbers(sandhi)));
+    }
+    private void speak(String text){
+        if(tts==null){emit("notice",object("text","Китайский TTS ещё не загружен."));return;}
+        if(text==null||text.isEmpty())return;
+        tts.setSpeechRate(.84f);
+        int result=tts.speak(text,TextToSpeech.QUEUE_FLUSH,null,"mandarin_sample");
+        if(result==TextToSpeech.ERROR)emit("notice",object("text","Установи китайский голос в настройках синтеза речи Android."));
+    }
+    private void start(String text,String toneOverride){
+        if(processing){emit("notice",object("text","Подожди окончания анализа записи."));return;}
+        if(recording){stop();return;}
+        String s=text==null?"":text.trim();
+        PinyinTones.Reading reading=PinyinTones.parse(s);
+        if(s.isEmpty()||reading.tones.length==0){emit("notice",object("text","Введи китайские иероглифы или пиньинь с цифрами тонов."));return;}
+        if(reading.tones.length>18){emit("notice",object("text","Для точного разбора введи до 18 слогов."));return;}
+        if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},123);
+            emit("notice",object("text","Разреши доступ к микрофону и нажми запись ещё раз."));
+            return;
+        }
+        currentText=s;currentToneOverride=toneOverride==null?"":toneOverride;
+        if(tts!=null)tts.stop();
+        int min=AudioRecord.getMinBufferSize(SAMPLE_RATE,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);
+        try{
+            recorder=new AudioRecord(MediaRecorder.AudioSource.MIC,SAMPLE_RATE,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,Math.max(4096,min));
+            if(recorder.getState()!=AudioRecord.STATE_INITIALIZED)throw new IllegalStateException("AudioRecord не инициализирован");
+            sampleCount=0;recorder.startRecording();recording=true;
+            emit("recording",object("active",true));
+            captureThread=new Thread(()->{
+                short[] tmp=new short[2048];long lastSignal=0;
+                while(recording&&sampleCount<pcm.length){
+                    AudioRecord r=recorder;if(r==null)break;
+                    int max=Math.min(tmp.length,pcm.length-sampleCount);
+                    int n;try{n=r.read(tmp,0,max);}catch(Exception e){break;}
+                    if(n<=0)break;
+                    System.arraycopy(tmp,0,pcm,sampleCount,n);sampleCount+=n;
+                    long now=System.currentTimeMillis();
+                    if(now-lastSignal>=110){
+                        double power=0;for(int i=0;i<n;i++)power+=tmp[i]*(double)tmp[i];
+                        double rms=Math.sqrt(power/n)/9000;
+                        emit("level",object("level",Math.max(0,Math.min(1,rms)),"seconds",sampleCount/(double)SAMPLE_RATE));
+                        lastSignal=now;
+                    }
+                }
+                if(recording)runOnUiThread(this::stop);
+            },"mic-capture");
+            captureThread.start();
+        }catch(Exception e){recording=false;
+            if(recorder!=null){try{recorder.release();}catch(Exception ignored){}}
+            recorder=null;emit("notice",object("text","Микрофон недоступен: "+e.getMessage()));
+        }
+    }
+    private void stop(){
+        if(!recording)return;
+        recording=false;
+        AudioRecord r=recorder;recorder=null;
+        if(r!=null){try{r.stop();}catch(Exception ignored){}try{r.release();}catch(Exception ignored){}}
+        Thread t=captureThread;
+        if(t!=null&&t!=Thread.currentThread())try{t.join(400);}catch(InterruptedException ignored){}
+        int len=sampleCount;
+        emit("recording",object("active",false));
+        if(len<3200){emit("notice",object("text","Запись слишком короткая, попробуй ещё раз."));return;}
+        processing=true;
+        emit("working",object("active",true));
+        final short[] audio=new short[len];System.arraycopy(pcm,0,audio,0,len);
+        final String text=currentText;
+        final PinyinTones.Reading readings=PinyinTones.parse(text);
+        final int[] target=PinyinTones.corrected(currentToneOverride,PinyinTones.sandhi(text,readings.tones));
+        new Thread(()->{
+            try{
+                PitchEngine.Result result=PitchEngine.analyze(audio,audio.length,target);
+                String spoken=recognition.recognize(audio,audio.length);
+                int matches=0;
+                if(!spoken.isEmpty()){
+                    int common=lcs(text.replaceAll("\\s+",""),spoken.replaceAll("\\s+",""));
+                    matches=(int)Math.round(200.0*common/Math.max(1,text.length()+spoken.length()));
+                }
+                JSONObject payload=object("text",text,"recognized",spoken,"recognitionReady",recognition.isReady(),"recognitionSimilarity",matches,
+                    "shapeScore",result.shapeScore,"voicedPercent",result.voicedPercent,"note",result.note,"seconds",len/(double)SAMPLE_RATE);
+                JSONArray actual=new JSONArray(),ideal=new JSONArray(),hz=new JSONArray(),segments=new JSONArray();
+                int stride=Math.max(1,result.normalized.length/180);
+                for(int i=0;i<result.normalized.length;i+=stride){
+                    actual.put(round(result.normalized[i]));ideal.put(round(result.target[i]));hz.put(round(result.pitchHz[i]));
+                }
+                for(int i=0;i<result.segments.length;i++){
+                    PitchEngine.Segment seg=result.segments[i];
+                    segments.put(object("syllable",i<readings.syllables.length?readings.syllables[i]:"?","expected",seg.expected,
+                        "guessed",seg.guessed,"score",seg.score,"confident",seg.confident));
+                }
+                payload.put("curve",actual);payload.put("targetCurve",ideal);payload.put("hertz",hz);payload.put("segments",segments);
+                JSONArray history=stored("history");
+                JSONObject summary=object("id",System.currentTimeMillis(),"text",text,"score",result.shapeScore,"recognized",spoken,"date",System.currentTimeMillis(),"syllables",target.length,"perTone",segments);
+                JSONArray revised=new JSONArray();revised.put(summary);
+                for(int i=0;i<Math.min(149,history.length());i++)revised.put(history.opt(i));
+                save("history",revised);
+                emit("analysis",payload);
+                emit("history",object("items",revised));
+            }catch(Exception e){emit("notice",object("text","Ошибка анализа: "+e.getMessage()));}
+            finally{processing=false;emit("working",object("active",false));}
+        },"tone-analyzer").start();
+    }
+    private static int round(float n){if(!Float.isFinite(n))return 0;return (int)Math.round(n*100f)/1;}
+    private static int lcs(String a,String b){
+        int[][] dp=new int[a.length()+1][b.length()+1];
+        for(int i=1;i<=a.length();i++)for(int j=1;j<=b.length();j++)dp[i][j]=a.charAt(i-1)==b.charAt(j-1)?dp[i-1][j-1]+1:Math.max(dp[i-1][j],dp[i][j-1]);
+        return dp[a.length()][b.length()];
+    }
+    private void savePhrase(String text,String customTones){
+        String s=text==null?"":text.trim();if(s.isEmpty())return;
+        JSONArray existing=stored("saved"),out=new JSONArray();
+        out.put(object("text",s,"tones",customTones==null?"":customTones,"date",System.currentTimeMillis()));
+        for(int i=0;i<Math.min(existing.length(),99);i++){
+            JSONObject item=existing.optJSONObject(i);
+            if(item!=null&&!s.equals(item.optString("text")))out.put(item);
+        }
+        save("saved",out);emit("saved",object("items",out));emit("notice",object("text","Добавлено в мою коллекцию"));
+    }
+    private void removePhrase(String text){
+        JSONArray original=stored("saved"),out=new JSONArray();
+        for(int i=0;i<original.length();i++){
+            JSONObject item=original.optJSONObject(i);if(item!=null&&!item.optString("text").equals(text))out.put(item);
+        }
+        save("saved",out);emit("saved",object("items",out));
+    }
+    private void quizAnswer(boolean correct){
+        int attempts=prefs().getInt("quizAttempts",0)+1;
+        int wins=prefs().getInt("quizCorrect",0)+(correct?1:0);
+        prefs().edit().putInt("quizAttempts",attempts).putInt("quizCorrect",wins).apply();
+        emit("quizStats",object("attempts",attempts,"correct",wins));
+    }
+    public class Bridge {
+        @JavascriptInterface public void ready(){runOnUiThread(MainActivity.this::sendBoot);}
+        @JavascriptInterface public void preview(String text){runOnUiThread(()->emitPreview(text));}
+        @JavascriptInterface public void speak(String text){runOnUiThread(()->MainActivity.this.speak(text));}
+        @JavascriptInterface public void record(String text,String tones){runOnUiThread(()->{if(recording)stop();else start(text,tones);});}
+        @JavascriptInterface public void savePhrase(String text,String tones){runOnUiThread(()->MainActivity.this.savePhrase(text,tones));}
+        @JavascriptInterface public void removePhrase(String text){runOnUiThread(()->MainActivity.this.removePhrase(text));}
+        @JavascriptInterface public void quizAnswer(boolean correct){runOnUiThread(()->MainActivity.this.quizAnswer(correct));}
+        @JavascriptInterface public void clearHistory(){runOnUiThread(()->{save("history",new JSONArray());emit("history",object("items",new JSONArray()));});}
+    }
+    @Override protected void onPause(){if(recording)stop();super.onPause();}
+    @Override protected void onDestroy(){
+        recording=false;
+        if(recorder!=null){try{recorder.stop();recorder.release();}catch(Exception ignored){}}
+        if(tts!=null){tts.stop();tts.shutdown();}
+        recognition.close();
+        if(web!=null){web.removeJavascriptInterface("Native");web.destroy();web=null;}
+        super.onDestroy();
+    }
 }
